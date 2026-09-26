@@ -1,3 +1,184 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>无人机空域协调台</title>
+<link rel="stylesheet" href="/static/console.css">
+</head>
+<body>
+<header>
+  <h1>无人机空域协调台</h1>
+  <p>按连续航段展示飞行计划，逐段标注与禁飞区水平范围、高度区间重叠的冲突位置。提交、审核、变更和紧急授权通过 JSON API 完成。</p>
+</header>
+<section class="controls">
+  <label>用户 <input id="u" value="reviewer"></label>
+  <label>角色
+    <select id="r">
+      <option value="airspace_reviewer" selected>airspace_reviewer</option>
+      <option value="commander">commander</option>
+      <option value="auditor">auditor</option>
+      <option value="operator">operator</option>
+      <option value="viewer">viewer</option>
+    </select>
+  </label>
+  <label>运营方 <input id="op" value="OP1"></label>
+  <button id="refresh">刷新</button>
+  <span id="server-time"></span>
+</section>
+<section>
+  <h2>生效中的空域限制</h2>
+  <div id="restrictions"></div>
+</section>
+<section>
+  <h2>飞行计划与航段冲突</h2>
+  <div id="plans"></div>
+</section>
+<script>
+const $ = (id) => document.getElementById(id);
+
+function headers() {
+  const h = { "X-User-Id": $("u").value.trim() || "anonymous", "X-Role": $("r").value };
+  if ($("r").value === "operator") h["X-Operator"] = $("op").value.trim();
+  return h;
+}
+
+const fmtNum = (v) => Number(v).toFixed(4);
+const fmtPoint = (p) => `(${fmtNum(p[0])}, ${fmtNum(p[1])})`;
+const fmtBox = (b) => (b ? `[${b.map(fmtNum).join(", ")}]` : "—");
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(path) {
+  const resp = await fetch(path, { headers: headers() });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) return { _error: data.message || resp.statusText };
+  return data;
+}
+
+async function load() {
+  const state = await api("/api/state");
+  $("server-time").textContent = state.server_time ? `服务器时间 ${state.server_time}` : "";
+  renderRestrictions(state.restrictions || []);
+  const plans = state.plans || [];
+  const checks = await Promise.all(plans.map((p) => api(`/api/plans/${p.id}/check`)));
+  renderPlans(plans, checks, state.restrictions || []);
+}
+
+function renderRestrictions(list) {
+  const el = $("restrictions");
+  if (!list.length) { el.innerHTML = '<p class="empty">当前角色下无可见限制区。</p>'; return; }
+  el.innerHTML = `<table><thead><tr><th>名称</th><th>类型</th><th>水平范围</th><th>高度区间(m)</th><th>生效时间</th><th>原因</th></tr></thead><tbody>${
+    list.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.kind)}</td><td>${fmtBox([r.min_lon, r.min_lat, r.max_lon, r.max_lat])}</td><td>${r.min_altitude} – ${r.max_altitude}</td><td>${esc(r.starts_at)}<br>${esc(r.ends_at)}</td><td>${esc(r.reason)}</td></tr>`).join("")
+  }</tbody></table>`;
+}
+
+function conflictSegmentSet(check) {
+  const set = new Set();
+  ((check && check.blocking_conflicts) || []).forEach((c) => {
+    if (c.code === "airspace_restriction") set.add(c.segment_index);
+  });
+  return set;
+}
+
+function segmentTable(segments, flagged) {
+  return `<table><thead><tr><th>航段</th><th>起点</th><th>终点</th><th>起止高度(m)</th><th>状态</th></tr></thead><tbody>${
+    segments.map((s) => {
+      const hit = flagged.has(s.index);
+      return `<tr class="${hit ? "conflict" : ""}"><td>${s.index + 1}</td><td>${fmtPoint(s.start)}</td><td>${fmtPoint(s.end)}</td><td>${s.start_altitude} → ${s.end_altitude}</td><td><span class="tag ${hit ? "conflict" : "ok"}">${hit ? "冲突" : "正常"}</span></td></tr>`;
+    }).join("")
+  }</tbody></table>`;
+}
+
+function conflictList(conflicts, hard) {
+  const parts = [];
+  if (hard.length) parts.push(`<ul class="conflicts hard">${hard.map((h) => `<li>硬约束：${esc(h.message)}</li>`).join("")}</ul>`);
+  if (!conflicts.length) { parts.push('<p class="empty">无阻塞冲突，可进入批准流程。</p>'); return parts.join(""); }
+  parts.push(`<ul class="conflicts">${conflicts.map((c) => {
+    if (c.code === "airspace_restriction")
+      return `<li>${esc(c.message)}；航段高度 ${c.segment_altitude_range.join("–")}m ∩ 限制 ${c.restriction_altitude_range.join("–")}m，冲突位置 ${fmtBox(c.overlap_bbox)}</li>`;
+    if (c.code === "adjacent_traffic")
+      return `<li>相邻航路冲突：${(c.plans || []).map((p) => `${esc(p.callsign)}(${esc(p.status)})`).join("、")}</li>`;
+    return `<li>${esc(c.message || c.code)}</li>`;
+  }).join("")}</ul>`);
+  return parts.join("");
+}
+
+function renderPlans(plans, checks, restrictions) {
+  const el = $("plans");
+  if (!plans.length) { el.innerHTML = '<p class="empty">暂无计划。</p>'; return; }
+  el.innerHTML = "";
+  plans.forEach((plan, i) => {
+    const check = checks[i] || {};
+    const conflicts = check.blocking_conflicts || [];
+    const hard = check.hard_violations || [];
+    const flagged = conflictSegmentSet(check);
+    const segments = plan.segments || [];
+    const card = document.createElement("div");
+    card.className = "plan";
+    card.innerHTML = `
+      <div class="plan-head">
+        <h3>${esc(plan.callsign)}</h3>
+        <span class="badge ${esc(plan.status)}">${esc(plan.status)}</span>
+        <span class="meta">版本 ${plan.revision} · ${esc(plan.operator_id || "")} · ${esc(plan.region || "")} · 最大高度 ${plan.max_altitude}m</span>
+        <span class="meta">${esc(plan.starts_at)} ~ ${esc(plan.ends_at)}</span>
+      </div>
+      <div class="plan-body">
+        <div>${segments.length ? segmentTable(segments, flagged) : '<p class="empty">当前角色不可见航段。</p>'}${conflictList(conflicts, hard)}</div>
+        <div>
+          <canvas class="map" width="640" height="280"></canvas>
+          <p class="legend"><i style="background:#2563eb"></i>正常航段<i style="background:#dc2626"></i>冲突航段<i style="background:rgba(220,38,38,.35)"></i>限制区</p>
+        </div>
+      </div>`;
+    el.appendChild(card);
+    drawMap(card.querySelector("canvas"), segments, restrictions, flagged);
+  });
+}
+
+function drawMap(canvas, segments, restrictions, flagged) {
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height, pad = 26;
+  const xs = [], ys = [];
+  segments.forEach((s) => { xs.push(s.start[0], s.end[0]); ys.push(s.start[1], s.end[1]); });
+  restrictions.forEach((r) => { xs.push(r.min_lon, r.max_lon); ys.push(r.min_lat, r.max_lat); });
+  ctx.clearRect(0, 0, W, H);
+  if (!xs.length) return;
+  let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  if (x1 - x0 < 1e-6) { x0 -= 0.01; x1 += 0.01; }
+  if (y1 - y0 < 1e-6) { y0 -= 0.01; y1 += 0.01; }
+  const sx = (W - 2 * pad) / (x1 - x0), sy = (H - 2 * pad) / (y1 - y0);
+  const X = (lon) => pad + (lon - x0) * sx, Y = (lat) => H - pad - (lat - y0) * sy;
+  restrictions.forEach((r) => {
+    const w = (r.max_lon - r.min_lon) * sx, h = (r.max_lat - r.min_lat) * sy;
+    ctx.fillStyle = "rgba(220,38,38,0.12)";
+    ctx.strokeStyle = "rgba(220,38,38,0.6)";
+    ctx.lineWidth = 1;
+    ctx.fillRect(X(r.min_lon), Y(r.max_lat), w, h);
+    ctx.strokeRect(X(r.min_lon), Y(r.max_lat), w, h);
+  });
+  segments.forEach((s) => {
+    const hit = flagged.has(s.index);
+    ctx.strokeStyle = hit ? "#dc2626" : "#2563eb";
+    ctx.lineWidth = hit ? 3 : 2;
+    ctx.beginPath();
+    ctx.moveTo(X(s.start[0]), Y(s.start[1]));
+    ctx.lineTo(X(s.end[0]), Y(s.end[1]));
+    ctx.stroke();
+    [s.start, s.end].forEach((p) => {
+      ctx.fillStyle = "#1e293b";
+      ctx.beginPath();
+      ctx.arc(X(p[0]), Y(p[1]), 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    if (hit) {
+      ctx.fillStyle = "#dc2626";
+      ctx.font = "12px system-ui";
+      ctx.fillText(String(s.index + 1), X(s.end[0]) + 4, Y(s.end[1]) - 4);
+    }
+  });
+}
+
+$("refresh").addEventListener("click", load);
+load();
+</script>
+</body>
+</html>

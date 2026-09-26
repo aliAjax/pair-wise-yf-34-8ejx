@@ -13,6 +13,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from segments import (
+    RouteError,
+    boxes_overlap,
+    compute_segments,
+    find_airspace_conflicts,
+    route_bbox,
+    validate_route,
+)
+
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
@@ -32,27 +41,15 @@ def parse_time(value: str | None) -> datetime:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
-def route_bbox(route: list[list[float]]) -> tuple[float, float, float, float]:
-    xs = [float(point[0]) for point in route]; ys = [float(point[1]) for point in route]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
-    return a[0] <= b[2] + buffer and a[2] + buffer >= b[0] and a[1] <= b[3] + buffer and a[3] + buffer >= b[1]
-
-
 def times_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool: return a_start < b_end and b_start < a_end
 
 
-def validate_route(route: Any) -> list[list[float]]:
-    if not isinstance(route, list) or len(route) < 2: raise ApiError(400, "invalid_route", "航线至少需要两个经纬度点")
-    normalized: list[list[float]] = []
-    for point in route:
-        if not isinstance(point, list) or len(point) != 2 or not all(isinstance(v, (int, float)) for v in point): raise ApiError(400, "invalid_route_point", "每个航线点必须是 [经度,纬度]")
-        lon, lat = float(point[0]), float(point[1])
-        if not -180 <= lon <= 180 or not -90 <= lat <= 90: raise ApiError(400, "invalid_coordinates", "经纬度超出范围")
-        normalized.append([lon, lat])
-    return normalized
+def checked_route(route: Any, max_altitude: float | None = None) -> list[list[float]]:
+    """校验航线输入，航点可携带高度，且不能超过申报的最大高度。"""
+    try:
+        return validate_route(route, max_altitude)
+    except RouteError as exc:
+        raise ApiError(400, exc.code, exc.message) from exc
 
 
 class Repository:
@@ -136,9 +133,11 @@ class DroneAirspaceService:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
         required = ("callsign", "drone_model", "starts_at", "ends_at", "emergency_plan", "region")
         if any(body.get(key) in (None, "") for key in required): raise ApiError(400, "missing_fields", "飞行计划字段不完整")
-        route = validate_route(body.get("route")); start, end = parse_time(body["starts_at"]), parse_time(body["ends_at"])
+        route_input = body.get("route")
+        start, end = parse_time(body["starts_at"]), parse_time(body["ends_at"])
         try: payload, altitude = float(body.get("payload_kg")), float(body.get("max_altitude"))
         except (TypeError, ValueError): raise ApiError(400, "invalid_numbers", "payload_kg 和 max_altitude 必须为数字")
+        route = checked_route(route_input, altitude)
         risk = body.get("population_risk")
         if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5:
             raise ApiError(400, "invalid_plan", "载荷、高度或人口风险无效")
@@ -174,25 +173,24 @@ class DroneAirspaceService:
         if plan["payload_kg"] > 25: hard.append({"code": "payload_limit", "message": "载荷超过 25kg 硬限制"})
         if plan["max_altitude"] > 120: hard.append({"code": "altitude_limit", "message": "常规计划高度不得超过 120m"})
         if plan["population_risk"] > 3: blocking.append({"code": "population_risk", "risk": plan["population_risk"], "message": "人口风险超过常规批准阈值"})
-        for restriction in conn.execute("SELECT * FROM restrictions WHERE status='active'"):
-            rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
-            if not boxes_overlap(bbox, rbox): continue
-            if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): continue
-            altitude_overlap = plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0
-            if altitude_overlap:
-                item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
-                blocking.append(item)
+        # 航段拆分后逐段核对限制区的水平范围和高度区间，冲突项带航段编号和限制名称
+        segments = compute_segments(route, plan["max_altitude"])
+        active_restrictions = [r for r in conn.execute("SELECT * FROM restrictions WHERE status='active'")
+                               if times_overlap(start, end, parse_time(r["starts_at"]), parse_time(r["ends_at"]))]
+        blocking.extend(find_airspace_conflicts(segments, active_restrictions))
         adjacent: list[dict[str, Any]] = []
         for other in conn.execute("SELECT * FROM flight_plans WHERE id!=? AND status IN ('submitted','approved') AND starts_at<? AND ends_at>?", (plan["id"], iso(end), iso(start))):
             if boxes_overlap(bbox, route_bbox(self._route(other)), 0.002):
                 adjacent.append({"plan_id": other["id"], "callsign": other["callsign"], "operator_id": other["operator_id"], "status": other["status"], "starts_at": other["starts_at"], "ends_at": other["ends_at"]})
         if adjacent: blocking.append({"code": "adjacent_traffic", "plans": adjacent, "message": "相邻航路与有效计划重叠"})
-        return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
+        return {"plan_id": plan["id"], "revision": plan["revision"], "segments": segments,
+                "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
 
     def get_plan(self, plan_id: int, role: str, operator: str = "") -> dict[str, Any]:
         conn = self.repo.conn; row = self._plan_row(conn, plan_id)
         if role == "operator" and row["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能查看其他运营方计划")
         result = dict(row); result["route"] = json.loads(result.pop("route_json")); result["route_bbox"] = route_bbox(result["route"])
+        result["segments"] = compute_segments(result["route"], result["max_altitude"])
         if role == "viewer":
             result = {key: result[key] for key in ("id", "callsign", "starts_at", "ends_at", "max_altitude", "region", "status", "valid_until" if "valid_until" in result else "updated_at")}
         if role in {"airspace_reviewer", "commander", "auditor"}: result["approvals"] = [dict(r) for r in conn.execute("SELECT * FROM approvals WHERE plan_id=? ORDER BY id", (plan_id,))]
@@ -264,17 +262,23 @@ class DroneAirspaceService:
             if plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能修改其他运营方计划")
             if plan["status"] in {"canceled", "expired"}: raise ApiError(409, "plan_closed", "已取消或过期计划不能修改")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化")
-            route = validate_route(body.get("route", self._route(plan)))
             start = parse_time(body.get("starts_at", plan["starts_at"])); end = parse_time(body.get("ends_at", plan["ends_at"]))
             if end <= start or start <= utcnow(): raise ApiError(400, "invalid_time", "新飞行时间无效")
-            payload = float(body.get("payload_kg", plan["payload_kg"])); altitude = float(body.get("max_altitude", plan["max_altitude"]))
+            try:
+                payload = float(body.get("payload_kg", plan["payload_kg"]))
+                altitude = float(body.get("max_altitude", plan["max_altitude"]))
+            except (TypeError, ValueError): raise ApiError(400, "invalid_numbers", "payload_kg 和 max_altitude 必须为数字")
             risk = body.get("population_risk", plan["population_risk"])
             if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5: raise ApiError(400, "invalid_plan", "变更后的载荷、高度或风险无效")
+            route = checked_route(body.get("route", self._route(plan)), altitude)
+            segments_changed = compute_segments(self._route(plan), plan["max_altitude"]) != compute_segments(route, altitude)
             revision = expected + 1
             conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
                          (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
-            if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
+            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"], "segments_changed": segments_changed})
+            if plan["status"] == "approved":
+                scope = "航段已改动，" if segments_changed else "计划已修改，"
+                Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} {scope}原批准自动失效，需重新提交审核")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
 
@@ -326,9 +330,23 @@ def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> Non
     raw = json.dumps(payload, ensure_ascii=False, default=str).encode(); handler.send_response(status); handler.send_header("Content-Type", "application/json; charset=utf-8"); handler.send_header("Content-Length", str(len(raw))); handler.end_headers(); handler.wfile.write(raw)
 
 
+CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+
+
 class Handler(BaseHTTPRequestHandler):
     service: DroneAirspaceService; web_root: Path
     def log_message(self, fmt: str, *args: Any) -> None: print(f"{self.address_string()} - {fmt % args}")
+    def serve_static(self, path: str) -> None:
+        name = "index.html" if path == "/" else path[len("/static/"):]
+        target = (self.web_root / name).resolve()
+        if not target.is_file() or self.web_root.resolve() not in target.parents:
+            raise ApiError(404, "not_found", "页面不存在")
+        raw = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", CONTENT_TYPES.get(target.suffix, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
     def body(self) -> dict[str, Any]:
         size = int(self.headers.get("Content-Length", "0"))
         if not size: return {}
@@ -364,8 +382,8 @@ class Handler(BaseHTTPRequestHandler):
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
         try:
-            if method == "GET" and parsed.path == "/":
-                raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and (parsed.path == "/" or parsed.path.startswith("/static/")):
+                self.serve_static(parsed.path); return
             status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path); send_json(self, status, payload)
         except ApiError as exc:
             payload = {"error": exc.code, "message": exc.message}
